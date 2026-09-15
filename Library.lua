@@ -488,6 +488,9 @@ local Library = { } do
 	Library.RestingValues = setmetatable({ }, { __mode = "k" })
 	Library.Baselines = setmetatable({ }, { __mode = "k" })
 	Library.FadeTokens = setmetatable({ }, { __mode = "k" })
+	-- Heavy inventory pages can contain hundreds of cards and ViewportFrames.
+	-- Deep-fading those trees creates hundreds/thousands of tweens at once.
+	Library.NoDeepFadeRoots = setmetatable({ }, { __mode = "k" })
 
 	local function BumpFadeToken(Root)
 		local Next = (Library.FadeTokens[Root] or 0) + 1
@@ -496,8 +499,21 @@ local Library = { } do
 	end
 
 	local function CollectFadeable(Root)
-		local Children = Root:GetDescendants()
-		table.insert(Children, Root)
+		local Children = { Root }
+		if Library.NoDeepFadeRoots[Root] then
+			return Children
+		end
+
+		local function Walk(Node)
+			for _, Child in Node:GetChildren() do
+				table.insert(Children, Child)
+				if not Library.NoDeepFadeRoots[Child] then
+					Walk(Child)
+				end
+			end
+		end
+
+		Walk(Root)
 		return Children
 	end
 
@@ -3056,6 +3072,16 @@ local Library = { } do
 				Sub:SnapVisible()
 			end
 
+			-- Inventory pages can contain hundreds of ViewportFrames. Fading the
+			-- entire window while one is active would tween every descendant.
+			-- Use an instant shell toggle for those heavy pages instead.
+			if Sub and Sub.FastPage then
+				Items.Root:CancelFade()
+				Items.Root:HardRestore()
+				Items.Root.Instance.Visible = Bool
+				return
+			end
+
 			if Bool and Window.PlayIntro then
 				Window:PlayIntro()
 			else
@@ -3635,6 +3661,15 @@ local Library = { } do
 
 			LayoutPage()
 
+			if SubTab.FastPage then
+				ForEachRow(function(Data)
+					Data.Frame:CancelFade()
+					Data.Frame.Instance.Position = UDim2.fromOffset(0, Data.Y)
+					Data.Frame.Instance.Visible = Data.Visible ~= false
+				end)
+				return
+			end
+
 			local Order = 0
 
 			for _, Column in SubTab.Columns do
@@ -3690,6 +3725,14 @@ local Library = { } do
 			end)
 
 			StopPageTween()
+
+			if SubTab.FastPage then
+				Items.Page.Instance.Position = UDim2.fromOffset(0, 0)
+				Items.Page.Instance.Visible = false
+				Items.Page.Instance.Parent = Library.UnusedHolder.Instance
+				if OnDone then Library:SafeCall(OnDone) end
+				return
+			end
 
 			PageTween = Library:Tween({
 				Position = UDim2.fromOffset(-PageSlide, 0)
@@ -5261,14 +5304,49 @@ local Library = { } do
 			return Item ~= nil and Item.Selected == true
 		end
 
+		local function ClearCardPreview(Card)
+			if Card.PreviewReady then
+				ClearViewport(Card)
+			end
+			Card.PreviewReady = false
+			Card.PreviewItem = nil
+			Card.Image.Instance.Visible = false
+			Card.Viewport.Instance.Visible = false
+		end
+
+		local function LoadCardPreview(Card)
+			local Item = Card.Data
+			if not Item then
+				ClearCardPreview(Card)
+				return
+			end
+			if Card.PreviewReady and Card.PreviewItem == Item then return end
+
+			ClearCardPreview(Card)
+			if PrepareGameRewardViewport(Card, Item) then
+				Card.Image.Instance.Visible = false
+			elseif Item.Model and PrepareViewport(Card, Item.Model) then
+				Card.Image.Instance.Visible = false
+			else
+				local Icon = Item.Icon or Params.FallbackIcon or "rbxassetid://0"
+				ApplyIcon(Card.Image.Instance, Icon)
+				Card.Image.Instance.ImageColor3 = Item.IconColor or Color3.new(1, 1, 1)
+				Card.Image.Instance.Visible = true
+			end
+			Card.PreviewReady = true
+			Card.PreviewItem = Item
+		end
+
 		local function RenderCard(Card, Item, Index)
+			local SameItem = Card.Data == Item
+			if not SameItem then
+				ClearCardPreview(Card)
+			end
+
 			Card.Data = Item
 			Card.Index = Index
 			Card.Frame.Instance.Visible = Item ~= nil
-			if not Item then
-				ClearWorld(Card.World.Instance)
-				return
-			end
+			if not Item then return end
 
 			local Label = tostring(Item.Label or Item.Name or Item.Value or ("Item " .. tostring(Index)))
 			local Subtitle = tostring(Item.Subtitle or "")
@@ -5281,19 +5359,8 @@ local Library = { } do
 			Card.Stroke.Instance.Thickness = Selected and 2 or 1
 			Card.Frame.Instance.BackgroundColor3 = Selected and Library.Theme.Light or Library.Theme.Element
 
-			Card.Image.Instance.Visible = false
-			Card.Viewport.Instance.Visible = false
-			ClearViewport(Card)
-
-			if PrepareGameRewardViewport(Card, Item) then
-				Card.Image.Instance.Visible = false
-			elseif Item.Model and PrepareViewport(Card, Item.Model) then
-				Card.Image.Instance.Visible = false
-			else
-				local Icon = Item.Icon or Params.FallbackIcon or "package"
-				ApplyIcon(Card.Image.Instance, Icon)
-				Card.Image.Instance.ImageColor3 = Item.IconColor or Color3.new(1, 1, 1)
-				Card.Image.Instance.Visible = true
+			if Params.LazyPreview ~= true then
+				LoadCardPreview(Card)
 			end
 		end
 
@@ -5304,7 +5371,13 @@ local Library = { } do
 			local X = Padding + Column * (CardWidth + Gap)
 			local Y = 4 + Line * (CardHeight + Gap)
 
-			local Card = { Data = nil, Index = Index }
+			local Card = {
+				Data = nil,
+				Index = Index,
+				GridY = Y,
+				PreviewReady = false,
+				PreviewItem = nil,
+			}
 			Card.Frame = MakeFrame({
 				Parent = Row.Instance,
 				Pos = UDim2.fromOffset(X, Y),
@@ -5404,10 +5477,48 @@ local Library = { } do
 			table.insert(Grid.Cards, Card)
 		end
 
+
+		local function UpdateLazyPreviews()
+			if Params.LazyPreview ~= true then return end
+			local Scroll = Section.Column and Section.Column.Scroll and Section.Column.Scroll.Instance
+			if not Scroll then return end
+
+			local Buffer = CardHeight * 1.5
+			local ViewTop = Scroll.CanvasPosition.Y - Buffer
+			local ViewBottom = Scroll.CanvasPosition.Y + Scroll.AbsoluteSize.Y + Buffer
+			local BaseY = (Section.Y or 0) + (Section.HeaderVisible and 26 or 0) + (RowData.Y or 0)
+
+			for _, Card in Grid.Cards do
+				if Card.Data and Card.Frame.Instance.Visible then
+					local Top = BaseY + Card.GridY
+					local Bottom = Top + CardHeight
+					if Bottom >= ViewTop and Top <= ViewBottom then
+						LoadCardPreview(Card)
+					else
+						ClearCardPreview(Card)
+					end
+				else
+					ClearCardPreview(Card)
+				end
+			end
+		end
+
+		local LazyScroll = Section.Column and Section.Column.Scroll and Section.Column.Scroll.Instance
+		if Params.LazyPreview == true and LazyScroll then
+			local LastRow = -1
+			Library:Connect(LazyScroll:GetPropertyChangedSignal("CanvasPosition"), function()
+				local RowIndex = math.floor(LazyScroll.CanvasPosition.Y / math.max(CardHeight + Gap, 1))
+				if RowIndex == LastRow then return end
+				LastRow = RowIndex
+				UpdateLazyPreviews()
+			end)
+			Library:Connect(LazyScroll:GetPropertyChangedSignal("AbsoluteSize"), UpdateLazyPreviews)
+		end
 		local function RenderNow()
 			for Index = 1, Count do
 				RenderCard(Grid.Cards[Index], Grid.Items[Index], Index)
 			end
+			UpdateLazyPreviews()
 		end
 
 		function Grid:SetVisibleRows(NewRows)
@@ -5462,6 +5573,13 @@ local Library = { } do
 			Right = nil,
 			SearchInput = nil
 		}
+
+		-- Heavy inventory pages bypass SubTab/window descendant fades. Their
+		-- content can contain hundreds of cards and ViewportFrames.
+		SubTab.FastPage = true
+		if SubTab.Items and SubTab.Items.Page then
+			Library.NoDeepFadeRoots[SubTab.Items.Page.Instance] = true
+		end
 
 		local function GetMode(Category)
 			return Browser.Modes[Category] or "single"
@@ -5593,6 +5711,7 @@ local Library = { } do
 				CardHeight = Params.CardHeight or 112,
 				Items = { },
 				HideSubtitle = true,
+				LazyPreview = true,
 				FallbackIcon = Params.FallbackIcon or "rbxassetid://0",
 				Callback = function(Item)
 					Browser:Select(Item)
