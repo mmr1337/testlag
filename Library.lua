@@ -321,6 +321,9 @@ local Library = { } do
 	Library.TouchButtons = { }
 	Library.TouchShields = { }
 	Library.Searchables = { }
+	Library.InventoryBrowsers = { }
+	Library.ConfigBeforeSaveCallback = nil
+	Library.ConfigLoadedCallback = nil
 	Library.MenuKeybind = Enum.KeyCode.G
 	Library.Binding = false
 	Library.UserScale = 1
@@ -5740,6 +5743,7 @@ local Library = { } do
 			end)
 		end
 
+		table.insert(Library.InventoryBrowsers, Browser)
 		Browser:Render()
 		return setmetatable(Browser, Library)
 	end
@@ -6159,6 +6163,15 @@ local Library = { } do
 			return Library.ConfigFolder .. "/" .. Name .. ".json"
 		end
 
+		Config.AutoLoadPath = Library.ConfigFolder .. "/autoload.txt"
+		Config.AutoLoadName = nil
+		if isfile and readfile and isfile(Config.AutoLoadPath) then
+			pcall(function()
+				local value = tostring(readfile(Config.AutoLoadPath) or "")
+				if value ~= "" then Config.AutoLoadName = value end
+			end)
+		end
+
 		Items.CreateBox = MakeFrame({
 			Parent = Page.Instance,
 			Pos = UDim2.fromOffset(0, 0),
@@ -6520,6 +6533,31 @@ local Library = { } do
 
 		local RefreshList
 
+		function Config:RefreshAutoLoadRows()
+			for _, RowData in Config.Rows do
+				if RowData.SetAutoLoad then
+					RowData:SetAutoLoad(RowData.Name == Config.AutoLoadName)
+				end
+			end
+		end
+
+		function Config:ToggleAutoLoad(Name)
+			if Config.AutoLoadName == Name then
+				Config.AutoLoadName = nil
+				if delfile and isfile and isfile(Config.AutoLoadPath) then
+					pcall(delfile, Config.AutoLoadPath)
+				elseif writefile then
+					pcall(writefile, Config.AutoLoadPath, "")
+				end
+				Library:Notification({Name = "Auto load disabled", Description = "Config '" .. Name .. "' will no longer load automatically.", Icon = "pin"})
+			else
+				Config.AutoLoadName = Name
+				if writefile then pcall(writefile, Config.AutoLoadPath, Name) end
+				Library:Notification({Name = "Auto load enabled", Description = "Config '" .. Name .. "' will load automatically.", Icon = "pin"})
+			end
+			Config:RefreshAutoLoadRows()
+		end
+
 		local function AddRow(Index, Name)
 			local Slot = MakeFrame({
 				Parent = Items.List.Instance,
@@ -6565,7 +6603,7 @@ local Library = { } do
 				TextSize = 15,
 				Anchor = Vector2.new(0, 0.5),
 				Pos = UDim2.new(0, 15, 0.5, 0),
-				Size = UDim2.fromOffset(ColW - 130, 20),
+				Size = UDim2.fromOffset(ColW - 158, 20),
 				Color = "DimText",
 				Truncate = true,
 				Z = 5
@@ -6603,7 +6641,12 @@ local Library = { } do
 				end)
 
 				Hit:Connect("MouseButton1Down", Callback)
+				return Image, Hit
 			end
+
+			Data.AutoLoadIcon = select(1, IconButton(-92, "pin", function()
+				Config:ToggleAutoLoad(Name)
+			end))
 
 			IconButton(-66, "download", function()
 				local Created
@@ -6642,6 +6685,14 @@ local Library = { } do
 
 				if delfile and isfile and isfile(ConfigPath(Name)) then
 					delfile(ConfigPath(Name))
+				end
+				if Config.AutoLoadName == Name then
+					Config.AutoLoadName = nil
+					if delfile and isfile and isfile(Config.AutoLoadPath) then
+						pcall(delfile, Config.AutoLoadPath)
+					elseif writefile then
+						pcall(writefile, Config.AutoLoadPath, "")
+					end
 				end
 
 				if Config.Selected == Name then
@@ -6684,9 +6735,17 @@ local Library = { } do
 				end
 			end
 
+			function Data:SetAutoLoad(Active)
+				if not Data.AutoLoadIcon then return end
+				local Key = Active and "Accent" or "DimText"
+				Data.AutoLoadIcon:ChangeItemTheme({ImageColor3 = Key})
+				Data.AutoLoadIcon.Instance.ImageColor3 = Library.Theme[Key]
+			end
+			Data:SetAutoLoad(Name == Config.AutoLoadName)
+
 			local Hit = MakeButton({
 				Parent = Row.Instance,
-				Size = UDim2.new(1, -96, 1, 0),
+				Size = UDim2.new(1, -124, 1, 0),
 				Z = 5
 			})
 
@@ -6828,8 +6887,30 @@ local Library = { } do
 			RefreshList()
 		end
 
+		function Config:RunAutoLoad()
+			if not Config.AutoLoadName or Config.AutoLoadName == "" then return false end
+			if not isfile or not isfile(ConfigPath(Config.AutoLoadName)) then
+				Config.AutoLoadName = nil
+				if delfile and isfile and isfile(Config.AutoLoadPath) then pcall(delfile, Config.AutoLoadPath) end
+				Config:RefreshAutoLoadRows()
+				return false
+			end
+
+			Config.Selected = Config.AutoLoadName
+			for _, RowData in Config.Rows do
+				RowData:SetSelected(RowData.Name == Config.AutoLoadName)
+			end
+			ShowInfo(Config.AutoLoadName)
+			local Loaded = Library:LoadConfigFile(Config.AutoLoadName)
+			if Loaded then
+				Library:Notification({Name = "Config auto loaded", Description = "Loaded '" .. Config.AutoLoadName .. "'.", Icon = "check"})
+			end
+			return Loaded
+		end
+
 		RefreshList()
 		ShowInfo(nil)
+		Config:RefreshAutoLoadRows()
 
 		return Config
 	end
@@ -6849,7 +6930,7 @@ local Library = { } do
 			Parent = Library.Holder.Instance,
 			Anchor = Vector2.new(0.5, 0),
 			Pos = UDim2.new(0.5, 0, 0, 14),
-			Size = UDim2.fromOffset(0, 32),
+			Size = UDim2.fromOffset(0, IsMobile and 44 or 32),
 			Color = "Section",
 			Round = 8,
 			Z = 60
@@ -6957,6 +7038,31 @@ local Library = { } do
 		end)
 
 		Items.Bar:MakeDraggable()
+
+		-- A short click/tap toggles the owning window; dragging still moves the watermark.
+		local PressStart
+		local PressType
+		local PressClock = 0
+		Library:Connect(Items.Bar.Instance.InputBegan, function(Input)
+			local Type = Input.UserInputType
+			if Type ~= Enum.UserInputType.MouseButton1 and Type ~= Enum.UserInputType.Touch then return end
+			PressStart = Input.Position
+			PressType = Type
+			PressClock = os.clock()
+		end)
+		Library:Connect(UserInputService.InputEnded, function(Input)
+			if not PressStart or Input.UserInputType ~= PressType then return end
+			local Start = PressStart
+			PressStart = nil
+			PressType = nil
+			local Delta = Input.Position - Start
+			if math.abs(Delta.X) > 10 or math.abs(Delta.Y) > 10 then return end
+			if os.clock() - PressClock > 0.65 then return end
+			if Params.ToggleWindow ~= false and Self and Self.SetOpen then
+				Self:SetOpen(not Self.IsOpen)
+			end
+		end)
+
 		Library.WatermarkBar = Items.Bar
 
 		local Watermark = { Instance = Items.Bar.Instance }
@@ -6976,6 +7082,10 @@ local Library = { } do
 	end
 
 	Library.GetConfig = function(Self, Created)
+		if Library.ConfigBeforeSaveCallback then
+			Library:SafeCall(Library.ConfigBeforeSaveCallback)
+		end
+
 		local Config = { }
 
 		for Index, Value in Library.Flags do
@@ -7037,6 +7147,13 @@ local Library = { } do
 		end
 
 		Library.Silent = false
+
+		for _, Browser in ipairs(Library.InventoryBrowsers) do
+			pcall(function() Browser:Render() end)
+		end
+		if Library.ConfigLoadedCallback then
+			Library:SafeCall(Library.ConfigLoadedCallback, Decoded)
+		end
 		return true
 	end
 
