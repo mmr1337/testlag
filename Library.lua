@@ -196,7 +196,7 @@ local Library = { } do
 	end
 
 	Library.__index = Library
-	Library.Version = "1.8-scroll-grid"
+	Library.Version = "v1.3"
 	Library.WindowWidth = 716
 	Library.WindowHeight = 540
 
