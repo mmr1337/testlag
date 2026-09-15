@@ -196,7 +196,7 @@ local Library = { } do
 	end
 
 	Library.__index = Library
-	Library.Version = "1.4-capability-safe-icon-grid"
+	Library.Version = "1.6-no-external-render-closures"
 	Library.WindowWidth = 716
 	Library.WindowHeight = 540
 
@@ -5109,9 +5109,7 @@ local Library = { } do
 			Callback = Params.Callback or function() end,
 			Columns = Columns,
 			Rows = Rows,
-			Capacity = Count,
-			Dirty = true,
-			RenderConnection = nil
+			Capacity = Count
 		}
 
 		local Row = Section:AddRow(RowHeight, Grid.Name)
@@ -5124,21 +5122,8 @@ local Library = { } do
 			end
 		end
 
-		local GameUIHelpers
-		local GameUIHelpersTried = false
-
-		local function GetGameUIHelpers()
-			if GameUIHelpersTried then return GameUIHelpers end
-			GameUIHelpersTried = true
-			pcall(function()
-				local ReplicatedFirst = game:GetService("ReplicatedFirst")
-				local UI = require(ReplicatedFirst:WaitForChild("ui"))
-				if UI and UI.Helpers and type(UI.Helpers.SetupViewportFromRewardType) == "function" then
-					GameUIHelpers = UI.Helpers
-				end
-			end)
-			return GameUIHelpers
-		end
+		local ReplicatedStorage = game:GetService("ReplicatedStorage")
+		local RewardAssets = ReplicatedStorage:FindFirstChild("Assets")
 
 		local function ClearViewport(Card)
 			for _, Child in Card.Viewport.Instance:GetChildren() do
@@ -5152,26 +5137,63 @@ local Library = { } do
 
 		local function PrepareGameRewardViewport(Card, Item)
 			if type(Item) ~= "table" or not Item.RewardType or not Item.RewardName then return false end
-			local Helpers = GetGameUIHelpers()
-			if not Helpers then return false end
+			if not RewardAssets then return false end
+
+			local Source
+			if Item.RewardType == "Sword" then
+				local Swords = RewardAssets:FindFirstChild("Swords")
+				local Container = Swords and Swords:FindFirstChild(Item.RewardName)
+				Source = Container and Container:FindFirstChild("Sword")
+			elseif Item.RewardType == "Item" then
+				local ItemsFolder = RewardAssets:FindFirstChild("Items")
+				Source = ItemsFolder and ItemsFolder:FindFirstChild(Item.RewardName)
+			else
+				return false
+			end
+			if not Source then return false end
+
+			local Ok, Clone = pcall(function()
+				return Source:Clone()
+			end)
+			if not Ok or not Clone then return false end
+			if not (Clone:IsA("Model") or Clone:IsA("BasePart")) then
+				Clone:Destroy()
+				return false
+			end
 
 			ClearViewport(Card)
-			local Ok, Model, Camera = pcall(function()
-				return Helpers.SetupViewportFromRewardType(
-					Item.RewardType,
-					Item.RewardName,
-					Card.Viewport.Instance,
-					Item.UseImageModel == true
-				)
-			end)
-			if not Ok or not Model then return false end
-
-			-- The game's helper creates/reuses its own Camera and sets CurrentCamera.
-			-- Do not overwrite its CFrame: Sword previews rely on the exact stock
-			-- Distance/Big attributes, (0,-1,-2.5) offset and 45deg Z rotation.
-			if Camera and Camera:IsA("Camera") then
-				Card.Viewport.Instance.CurrentCamera = Camera
+			for _, Descendant in Clone:GetDescendants() do
+				if Descendant:IsA("BasePart") then
+					Descendant.Anchored = true
+					Descendant.CanCollide = false
+					Descendant.CanTouch = false
+					Descendant.CanQuery = false
+				end
 			end
+			if Clone:IsA("BasePart") then
+				Clone.Anchored = true
+				Clone.CanCollide = false
+				Clone.CanTouch = false
+				Clone.CanQuery = false
+			end
+
+			Clone.Parent = Card.Viewport.Instance
+			local Camera = Card.Camera.Instance
+			local Pivot = Clone:GetPivot()
+
+			if Item.RewardType == "Sword" then
+				-- Exact stock UIHelper sword framing.
+				local Distance = Clone:GetAttribute("Big") and 14 or (Clone:GetAttribute("Distance") or 12)
+				Camera.FieldOfView = 70
+				Camera.CFrame = Pivot * CFrame.new(0, 0, Distance) * CFrame.new(0, -1, -2.5)
+				Clone:PivotTo(Pivot * CFrame.Angles(0, 0, 0.7853981633974483))
+			else
+				-- Exact stock Item framing used by UIHelper.
+				Camera.FieldOfView = 30
+				Camera.CFrame = Clone:GetAttribute("CameraCFrame") or Pivot * CFrame.Angles(0, 0.4487989505128276, 0) * CFrame.new(0, 0, 8)
+			end
+
+			Card.Viewport.Instance.CurrentCamera = Camera
 			Card.Viewport.Instance.Visible = true
 			return true
 		end
@@ -5369,11 +5391,10 @@ local Library = { } do
 			end)
 			Card.Hit:Connect("MouseButton1Down", function()
 				if not Card.Data or Card.Data.Disabled then return end
+				-- Grid callbacks used by InventoryBrowser are library-owned. They render
+				-- synchronously before notifying external game code, so capability never
+				-- needs to cross back into UI writes afterwards.
 				Library:SafeCall(Grid.Callback, Card.Data, Card.Index)
-				-- External callbacks can run under a restricted capability context.
-				-- Only mutate Lua state here; the library-owned RenderStepped worker
-				-- performs all Instance writes on the next frame.
-				Grid.Dirty = true
 			end)
 
 			table.insert(Grid.Cards, Card)
@@ -5387,7 +5408,7 @@ local Library = { } do
 
 		function Grid:SetItems(NewItems)
 			Grid.Items = type(NewItems) == "table" and NewItems or { }
-			Grid.Dirty = true
+			RenderNow()
 		end
 
 		function Grid:GetItems()
@@ -5395,25 +5416,172 @@ local Library = { } do
 		end
 
 		function Grid:SetSelected(_)
-			-- Selection is supplied as Item.Selected. Keeping this method as a
-			-- compatibility no-op avoids calling external resolver functions while
-			-- rendering, which can drop Plugin capability in some environments.
-			Grid.Dirty = true
+			RenderNow()
 		end
 
 		function Grid:Refresh()
-			Grid.Dirty = true
+			RenderNow()
 		end
 
-		Grid.RenderConnection = Library:Connect(RunService.RenderStepped, function()
-			if not Grid.Dirty then return end
-			Grid.Dirty = false
-			RenderNow()
-		end)
-
+		RenderNow()
 		return setmetatable(Grid, Library)
 	end
 
+
+	Library.InventoryBrowser = function(Self, Params)
+		Params = Params or { }
+
+		local SubTab = Self
+		local Browser = {
+			Name = Params.Name or "Inventory Changer",
+			Categories = Params.Categories or { },
+			CategoryOrder = Params.CategoryOrder or { "Swords", "Dual", "Auras", "Poses", "Enchants" },
+			Modes = Params.Modes or { },
+			Category = Params.DefaultCategory or "Swords",
+			Query = "",
+			Page = 1,
+			PageSize = 12,
+			OnSelect = Params.OnSelect or function() end,
+			OnClear = Params.OnClear or function() end,
+			Left = nil,
+			Right = nil,
+			PageLabel = nil
+		}
+
+		local function GetMode(Category)
+			return Browser.Modes[Category] or "single"
+		end
+
+		local function FilteredItems()
+			local Source = Browser.Categories[Browser.Category] or { }
+			local Query = string.lower(Browser.Query or "")
+			if Query == "" then return Source end
+
+			local Out = { }
+			for _, Item in Source do
+				local Label = string.lower(tostring(Item.Label or Item.Name or Item.Value or ""))
+				if string.find(Label, Query, 1, true) then
+					table.insert(Out, Item)
+				end
+			end
+			return Out
+		end
+
+		function Browser:Render()
+			local Filtered = FilteredItems()
+			local Pages = math.max(1, math.ceil(#Filtered / Browser.PageSize))
+			Browser.Page = math.clamp(Browser.Page, 1, Pages)
+			local Start = (Browser.Page - 1) * Browser.PageSize + 1
+			local LeftItems, RightItems = { }, { }
+
+			for Index = 0, 5 do
+				local Item = Filtered[Start + Index]
+				if Item then table.insert(LeftItems, Item) end
+			end
+			for Index = 6, 11 do
+				local Item = Filtered[Start + Index]
+				if Item then table.insert(RightItems, Item) end
+			end
+
+			if Browser.Left then Browser.Left:SetItems(LeftItems) end
+			if Browser.Right then Browser.Right:SetItems(RightItems) end
+			if Browser.PageLabel then
+				Browser.PageLabel:Set(("Page %d / %d  •  %d items"):format(Browser.Page, Pages, #Filtered))
+			end
+		end
+
+		function Browser:Select(Item)
+			if type(Item) ~= "table" then return end
+			local Category = Browser.Category
+			local Source = Browser.Categories[Category] or { }
+			local Mode = GetMode(Category)
+
+			if Item.Value == "__clear__" then
+				for _, Entry in Source do
+					Entry.Selected = false
+				end
+			elseif Mode == "multi" then
+				Item.Selected = not Item.Selected
+			else
+				for _, Entry in Source do
+					Entry.Selected = false
+				end
+				Item.Selected = true
+			end
+
+			-- All UI mutation happens before entering external game code.
+			Browser:Render()
+			return Library:SafeCall(Browser.OnSelect, Category, Item)
+		end
+
+		function Browser:ClearAttachments()
+			for _, Category in { "Dual", "Auras", "Poses", "Enchants" } do
+				local Source = Browser.Categories[Category] or { }
+				for _, Entry in Source do
+					Entry.Selected = Entry.Value == "__none__"
+				end
+			end
+			Browser:Render()
+			return Library:SafeCall(Browser.OnClear)
+		end
+
+		local Controls = SubTab:Section({ Name = Browser.Name, Side = 1 })
+		Controls:Dropdown({
+			Name = "Category",
+			Items = Browser.CategoryOrder,
+			Default = Browser.Category,
+			Callback = function(Value)
+				Browser.Category = tostring(Value or Browser.Category)
+				Browser.Page = 1
+				Browser:Render()
+			end
+		})
+		Controls:Textbox({
+			Name = "Search",
+			Placeholder = "Search items...",
+			Finished = false,
+			Callback = function(Value)
+				Browser.Query = tostring(Value or "")
+				Browser.Page = 1
+				Browser:Render()
+			end
+		})
+		Browser.PageLabel = Controls:Label({ Name = "Page 1 / 1" })
+		Controls:Button({ Name = "Previous Page", Callback = function()
+			Browser.Page = math.max(1, Browser.Page - 1)
+			Browser:Render()
+		end })
+		Controls:Button({ Name = "Next Page", Callback = function()
+			Browser.Page += 1
+			Browser:Render()
+		end })
+		Controls:Button({ Name = "Clear Attachments", Callback = function()
+			Browser:ClearAttachments()
+		end })
+
+		local LeftSection = SubTab:Section({ Name = Params.LeftName or "Items", Side = 1 })
+		local RightSection = SubTab:Section({ Name = Params.RightName or "More Items", Side = 2 })
+
+		local function GridParams(Name)
+			return {
+				Name = Name,
+				Columns = 2,
+				Rows = 3,
+				CardHeight = Params.CardHeight or 112,
+				Items = { },
+				FallbackIcon = Params.FallbackIcon or "rbxassetid://0",
+				Callback = function(Item)
+					Browser:Select(Item)
+				end
+			}
+		end
+
+		Browser.Left = LeftSection:IconGrid(GridParams("InventoryLeft"))
+		Browser.Right = RightSection:IconGrid(GridParams("InventoryRight"))
+		Browser:Render()
+
+		return setmetatable(Browser, Library)
+	end
 	Library.Textbox = function(Self, Params)
 		Params = Params or { }
 
