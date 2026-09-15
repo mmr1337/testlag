@@ -196,7 +196,7 @@ local Library = { } do
 	end
 
 	Library.__index = Library
-	Library.Version = "1.6-no-external-render-closures"
+	Library.Version = "1.8-scroll-grid"
 	Library.WindowWidth = 716
 	Library.WindowHeight = 540
 
@@ -3773,6 +3773,7 @@ local Library = { } do
 			Height = 0,
 			Rows = { },
 			Dirty = false,
+			HeaderVisible = Params.HeaderVisible ~= false,
 			Items = { }
 		}
 
@@ -3830,9 +3831,11 @@ local Library = { } do
 		Library:Connect(Items.Label.Instance:GetPropertyChangedSignal("TextBounds"), SyncHeader)
 		task.defer(SyncHeader)
 
+		Items.Header.Instance.Visible = Section.HeaderVisible
+
 		Items.Frame = MakeFrame({
 			Parent = Items.Holder.Instance,
-			Pos = UDim2.fromOffset(0, 26),
+			Pos = UDim2.fromOffset(0, Section.HeaderVisible and 26 or 0),
 			Size = UDim2.fromOffset(Column.Width, 14),
 			Color = "Section",
 			Round = 10,
@@ -3870,7 +3873,7 @@ local Library = { } do
 
 			Items.Frame.Instance.Size = UDim2.fromOffset(Section.Width, FrameHeight)
 			Items.Holder.Instance.Visible = Visible > 0
-			Section.Height = Visible > 0 and (26 + FrameHeight) or 0
+			Section.Height = Visible > 0 and ((Section.HeaderVisible and 26 or 0) + FrameHeight) or 0
 			Items.Holder.Instance.Size = UDim2.fromOffset(Section.Width, math.max(Section.Height, 1))
 
 			Column:Reflow()
@@ -5112,9 +5115,10 @@ local Library = { } do
 			Capacity = Count
 		}
 
-		local Row = Section:AddRow(RowHeight, Grid.Name)
-		local Items = { Row = Row }
+		local Row, RowData = Section:AddRow(RowHeight, Grid.Name)
+		local Items = { Row = Row, RowData = RowData }
 		Grid.ItemsUI = Items
+		Grid.RowData = RowData
 
 		local function ClearWorld(World)
 			for _, Child in World:GetChildren() do
@@ -5270,7 +5274,7 @@ local Library = { } do
 			local Subtitle = tostring(Item.Subtitle or "")
 			Card.Label.Instance.Text = Label
 			Card.Subtitle.Instance.Text = Subtitle
-			Card.Subtitle.Instance.Visible = Subtitle ~= ""
+			Card.Subtitle.Instance.Visible = Params.HideSubtitle ~= true and Subtitle ~= ""
 
 			local Selected = IsSelected(Item)
 			Card.Stroke.Instance.Color = Selected and Library.Theme.Accent or Library.Theme.Line
@@ -5318,7 +5322,7 @@ local Library = { } do
 				Transparency = 0.05
 			})
 
-			local PreviewHeight = math.max(40, CardHeight - 42)
+			local PreviewHeight = math.max(40, CardHeight - (Params.HideSubtitle == true and 32 or 42))
 			Card.Image = MakeImage({
 				Parent = Card.Frame.Instance,
 				Pos = UDim2.fromOffset(8, 7),
@@ -5355,7 +5359,7 @@ local Library = { } do
 				Parent = Card.Frame.Instance,
 				Text = "",
 				TextSize = 13,
-				Pos = UDim2.new(0, 7, 1, -32),
+				Pos = UDim2.new(0, 7, 1, Params.HideSubtitle == true and -22 or -32),
 				Size = UDim2.new(1, -14, 0, 17),
 				Color = "Text",
 				Align = Enum.TextXAlignment.Center,
@@ -5406,6 +5410,20 @@ local Library = { } do
 			end
 		end
 
+		function Grid:SetVisibleRows(NewRows)
+			local VisibleRows = math.clamp(math.floor(tonumber(NewRows) or Rows), 0, Rows)
+			if VisibleRows <= 0 then
+				RowData.Visible = false
+				Section:Reflow()
+				return
+			end
+			RowData.Visible = true
+			local Height = (VisibleRows * CardHeight) + (Gap * (VisibleRows - 1)) + 8
+			RowData.Height = Height
+			Row.Instance.Size = UDim2.fromOffset(Section.Width, Height)
+			Section:Reflow()
+		end
+
 		function Grid:SetItems(NewItems)
 			Grid.Items = type(NewItems) == "table" and NewItems or { }
 			RenderNow()
@@ -5433,19 +5451,16 @@ local Library = { } do
 
 		local SubTab = Self
 		local Browser = {
-			Name = Params.Name or "Inventory Changer",
+			Name = Params.Name or "Inventory Browser",
 			Categories = Params.Categories or { },
-			CategoryOrder = Params.CategoryOrder or { "Swords", "Dual", "Auras", "Poses", "Enchants" },
+			CategoryOrder = Params.CategoryOrder or { },
 			Modes = Params.Modes or { },
-			Category = Params.DefaultCategory or "Swords",
+			Category = Params.DefaultCategory or (Params.CategoryOrder and Params.CategoryOrder[1]) or "Items",
 			Query = "",
-			Page = 1,
-			PageSize = 12,
 			OnSelect = Params.OnSelect or function() end,
-			OnClear = Params.OnClear or function() end,
 			Left = nil,
 			Right = nil,
-			PageLabel = nil
+			SearchInput = nil
 		}
 
 		local function GetMode(Category)
@@ -5469,24 +5484,25 @@ local Library = { } do
 
 		function Browser:Render()
 			local Filtered = FilteredItems()
-			local Pages = math.max(1, math.ceil(#Filtered / Browser.PageSize))
-			Browser.Page = math.clamp(Browser.Page, 1, Pages)
-			local Start = (Browser.Page - 1) * Browser.PageSize + 1
 			local LeftItems, RightItems = { }, { }
 
-			for Index = 0, 5 do
-				local Item = Filtered[Start + Index]
-				if Item then table.insert(LeftItems, Item) end
-			end
-			for Index = 6, 11 do
-				local Item = Filtered[Start + Index]
-				if Item then table.insert(RightItems, Item) end
+			for Index, Item in ipairs(Filtered) do
+				local ColumnInRow = (Index - 1) % 4
+				if ColumnInRow < 2 then
+					table.insert(LeftItems, Item)
+				else
+					table.insert(RightItems, Item)
+				end
 			end
 
-			if Browser.Left then Browser.Left:SetItems(LeftItems) end
-			if Browser.Right then Browser.Right:SetItems(RightItems) end
-			if Browser.PageLabel then
-				Browser.PageLabel:Set(("Page %d / %d  •  %d items"):format(Browser.Page, Pages, #Filtered))
+			local VisibleRows = math.ceil(#Filtered / 4)
+			if Browser.Left then
+				Browser.Left:SetVisibleRows(VisibleRows)
+				Browser.Left:SetItems(LeftItems)
+			end
+			if Browser.Right then
+				Browser.Right:SetVisibleRows(VisibleRows)
+				Browser.Right:SetItems(RightItems)
 			end
 		end
 
@@ -5501,7 +5517,13 @@ local Library = { } do
 					Entry.Selected = false
 				end
 			elseif Mode == "multi" then
-				Item.Selected = not Item.Selected
+				local NewState = not Item.Selected
+				if Item.Group ~= nil then
+					for _, Entry in Source do
+						if Entry.Group == Item.Group then Entry.Selected = false end
+					end
+				end
+				Item.Selected = NewState
 			else
 				for _, Entry in Source do
 					Entry.Selected = false
@@ -5509,66 +5531,68 @@ local Library = { } do
 				Item.Selected = true
 			end
 
-			-- All UI mutation happens before entering external game code.
+			-- Keep every UI write inside the library before calling external game code.
 			Browser:Render()
 			return Library:SafeCall(Browser.OnSelect, Category, Item)
 		end
 
-		function Browser:ClearAttachments()
-			for _, Category in { "Dual", "Auras", "Poses", "Enchants" } do
-				local Source = Browser.Categories[Category] or { }
-				for _, Entry in Source do
-					Entry.Selected = Entry.Value == "__none__"
-				end
+		local MaxItems = 0
+		for _, CategoryName in Browser.CategoryOrder do
+			MaxItems = math.max(MaxItems, #(Browser.Categories[CategoryName] or { }))
+		end
+		if MaxItems == 0 then
+			MaxItems = #(Browser.Categories[Browser.Category] or { })
+		end
+		local MaxRows = math.max(1, math.ceil(MaxItems / 4))
+
+		-- Inventory tabs use one full-width search field and two synchronized
+		-- Zolar columns below it. Each column renders two cards, which forms a
+		-- single visual 4-column grid with one vertical scroll position.
+		local Page = SubTab.Items and SubTab.Items.Page
+		local SearchHeight = 44
+		if Page then
+			local SearchFrame = MakeFrame({
+				Parent = Page.Instance,
+				Pos = UDim2.fromOffset(0, 0),
+				Size = UDim2.new(1, 0, 0, 36),
+				Color = "Element",
+				Round = 8,
+				Z = 30
+			})
+			Browser.SearchInput = MakeInput({
+				Parent = SearchFrame.Instance,
+				Placeholder = Params.SearchPlaceholder or "Search by name...",
+				Pos = UDim2.fromOffset(12, 0),
+				Size = UDim2.new(1, -24, 1, 0),
+				TextSize = 14,
+				Z = 31
+			})
+
+			for _, Column in SubTab.Columns do
+				local Scroll = Column.Scroll.Instance
+				local Position = Scroll.Position
+				Scroll.Position = UDim2.new(Position.X.Scale, Position.X.Offset, 0, SearchHeight)
+				local PageHeight = Page.Instance.Size.Y.Offset
+				Scroll.Size = UDim2.fromOffset(Column.Width, math.max(PageHeight - SearchHeight, 1))
 			end
-			Browser:Render()
-			return Library:SafeCall(Browser.OnClear)
+
+			Library:Connect(Browser.SearchInput.Instance:GetPropertyChangedSignal("Text"), function()
+				Browser.Query = tostring(Browser.SearchInput.Instance.Text or "")
+				Browser:Render()
+			end)
 		end
 
-		local Controls = SubTab:Section({ Name = Browser.Name, Side = 1 })
-		Controls:Dropdown({
-			Name = "Category",
-			Items = Browser.CategoryOrder,
-			Default = Browser.Category,
-			Callback = function(Value)
-				Browser.Category = tostring(Value or Browser.Category)
-				Browser.Page = 1
-				Browser:Render()
-			end
-		})
-		Controls:Textbox({
-			Name = "Search",
-			Placeholder = "Search items...",
-			Finished = false,
-			Callback = function(Value)
-				Browser.Query = tostring(Value or "")
-				Browser.Page = 1
-				Browser:Render()
-			end
-		})
-		Browser.PageLabel = Controls:Label({ Name = "Page 1 / 1" })
-		Controls:Button({ Name = "Previous Page", Callback = function()
-			Browser.Page = math.max(1, Browser.Page - 1)
-			Browser:Render()
-		end })
-		Controls:Button({ Name = "Next Page", Callback = function()
-			Browser.Page += 1
-			Browser:Render()
-		end })
-		Controls:Button({ Name = "Clear Attachments", Callback = function()
-			Browser:ClearAttachments()
-		end })
-
-		local LeftSection = SubTab:Section({ Name = Params.LeftName or "Items", Side = 1 })
-		local RightSection = SubTab:Section({ Name = Params.RightName or "More Items", Side = 2 })
+		local LeftSection = SubTab:Section({ Name = "", Side = 1, HeaderVisible = false })
+		local RightSection = SubTab:Section({ Name = "", Side = 2, HeaderVisible = false })
 
 		local function GridParams(Name)
 			return {
 				Name = Name,
 				Columns = 2,
-				Rows = 3,
+				Rows = MaxRows,
 				CardHeight = Params.CardHeight or 112,
 				Items = { },
+				HideSubtitle = true,
 				FallbackIcon = Params.FallbackIcon or "rbxassetid://0",
 				Callback = function(Item)
 					Browser:Select(Item)
@@ -5578,8 +5602,26 @@ local Library = { } do
 
 		Browser.Left = LeftSection:IconGrid(GridParams("InventoryLeft"))
 		Browser.Right = RightSection:IconGrid(GridParams("InventoryRight"))
-		Browser:Render()
 
+		local LeftScroll = SubTab.Columns[1] and SubTab.Columns[1].Scroll.Instance
+		local RightScroll = SubTab.Columns[2] and SubTab.Columns[2].Scroll.Instance
+		if LeftScroll and RightScroll then
+			local Syncing = false
+			local function Sync(Source, Target)
+				if Syncing then return end
+				Syncing = true
+				Target.CanvasPosition = Vector2.new(Target.CanvasPosition.X, Source.CanvasPosition.Y)
+				Syncing = false
+			end
+			Library:Connect(LeftScroll:GetPropertyChangedSignal("CanvasPosition"), function()
+				Sync(LeftScroll, RightScroll)
+			end)
+			Library:Connect(RightScroll:GetPropertyChangedSignal("CanvasPosition"), function()
+				Sync(RightScroll, LeftScroll)
+			end)
+		end
+
+		Browser:Render()
 		return setmetatable(Browser, Library)
 	end
 	Library.Textbox = function(Self, Params)
