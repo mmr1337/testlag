@@ -196,7 +196,7 @@ local Library = { } do
 	end
 
 	Library.__index = Library
-	Library.Version = "1.2-icon-grid"
+	Library.Version = "1.4-capability-safe-icon-grid"
 	Library.WindowWidth = 716
 	Library.WindowHeight = 540
 
@@ -5107,10 +5107,11 @@ local Library = { } do
 			Items = Params.Items or { },
 			Cards = { },
 			Callback = Params.Callback or function() end,
-			Selected = Params.Selected,
 			Columns = Columns,
 			Rows = Rows,
-			Capacity = Count
+			Capacity = Count,
+			Dirty = true,
+			RenderConnection = nil
 		}
 
 		local Row = Section:AddRow(RowHeight, Grid.Name)
@@ -5231,12 +5232,7 @@ local Library = { } do
 		end
 
 		local function IsSelected(Item)
-			if not Item then return false end
-			if type(Grid.Selected) == "function" then
-				local Ok, Result = pcall(Grid.Selected, Item)
-				return Ok and Result == true
-			end
-			return Item.Selected == true
+			return Item ~= nil and Item.Selected == true
 		end
 
 		local function RenderCard(Card, Item, Index)
@@ -5315,12 +5311,12 @@ local Library = { } do
 				Parent = Card.Frame.Instance,
 				Name = "\0",
 				BackgroundTransparency = 1,
-				Position = UDim2.fromOffset(8, 7),
-				Size = UDim2.new(1, -16, 0, PreviewHeight),
-				Ambient = Color3.fromRGB(190, 190, 190),
-				LightColor = Color3.new(1, 1, 1),
-				LightDirection = Vector3.new(-1, -1, -1),
-				ZIndex = 6,
+				AnchorPoint = Vector2.new(0.5, 0.5),
+				Position = UDim2.fromScale(0.5, 0.5),
+				-- Match the stock SwordGridButton ViewportFrame: the preview is
+				-- deliberately oversized so long swords fill the inventory card.
+				Size = UDim2.fromScale(2, 1.3),
+				ZIndex = 15,
 				BorderSizePixel = 0
 			})
 			Card.Camera = Library:Create("Camera", {
@@ -5374,33 +5370,47 @@ local Library = { } do
 			Card.Hit:Connect("MouseButton1Down", function()
 				if not Card.Data or Card.Data.Disabled then return end
 				Library:SafeCall(Grid.Callback, Card.Data, Card.Index)
-				Grid:Refresh()
+				-- External callbacks can run under a restricted capability context.
+				-- Only mutate Lua state here; the library-owned RenderStepped worker
+				-- performs all Instance writes on the next frame.
+				Grid.Dirty = true
 			end)
 
 			table.insert(Grid.Cards, Card)
 		end
 
+		local function RenderNow()
+			for Index = 1, Count do
+				RenderCard(Grid.Cards[Index], Grid.Items[Index], Index)
+			end
+		end
+
 		function Grid:SetItems(NewItems)
 			Grid.Items = type(NewItems) == "table" and NewItems or { }
-			Grid:Refresh()
+			Grid.Dirty = true
 		end
 
 		function Grid:GetItems()
 			return Grid.Items
 		end
 
-		function Grid:SetSelected(Resolver)
-			Grid.Selected = Resolver
-			Grid:Refresh()
+		function Grid:SetSelected(_)
+			-- Selection is supplied as Item.Selected. Keeping this method as a
+			-- compatibility no-op avoids calling external resolver functions while
+			-- rendering, which can drop Plugin capability in some environments.
+			Grid.Dirty = true
 		end
 
 		function Grid:Refresh()
-			for Index = 1, Count do
-				RenderCard(Grid.Cards[Index], Grid.Items[Index], Index)
-			end
+			Grid.Dirty = true
 		end
 
-		Grid:Refresh()
+		Grid.RenderConnection = Library:Connect(RunService.RenderStepped, function()
+			if not Grid.Dirty then return end
+			Grid.Dirty = false
+			RenderNow()
+		end)
+
 		return setmetatable(Grid, Library)
 	end
 
